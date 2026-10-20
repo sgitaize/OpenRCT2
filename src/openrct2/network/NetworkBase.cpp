@@ -49,7 +49,7 @@
 
 // Desync test builds (sgitaize/OpenRCT2 v0.5.6-desyncfix.N) use 200 + N, so they never connect to official builds
 // or to other desyncfix builds, which simulate differently.
-constexpr uint8_t kStreamVersion = 204;
+constexpr uint8_t kStreamVersion = 205;
 
 const std::string kStreamID = std::string(kOpenRCT2Version) + "-" + std::to_string(kStreamVersion);
 

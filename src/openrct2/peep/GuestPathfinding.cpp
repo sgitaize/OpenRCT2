@@ -16,6 +16,8 @@
 #include "../entity/Staff.h"
 #include "../profiling/Profiling.h"
 #include "../ride/RideData.h"
+#include "../ride/RideManager.hpp"
+#include "../ride/Station.h"
 #include "../scenario/Scenario.h"
 #include "../world/Footpath.h"
 #include "../world/Map.h"
@@ -44,6 +46,9 @@ namespace OpenRCT2::PathFinding
         { kMaxJunctionsStaff, kMaxJunctionsGuest, kMaxJunctionsGuestWithMap, kMaxJunctionsGuestLeavingPark,
           kMaxJunctionsGuestLeavingParkLost });
 
+    // Height tolerance when matching path elements (accounts for sloped paths).
+    static constexpr int kPathHeightTolerance = 2;
+
     struct PathFindingState
     {
         int8_t junctionCount;
@@ -52,6 +57,9 @@ namespace OpenRCT2::PathFinding
         // TODO: Move them, those are query parameters not really state, but for now its easier to pass it down.
         bool ignoreForeignQueues;
         RideId queueRideIndex;
+        RideId usedTransportRideId;
+        bool hasUsableTransport;
+        bool foundPathViaTransport;
         // A junction history for the peep path finding heuristic search.
         struct
         {
@@ -64,19 +72,20 @@ namespace OpenRCT2::PathFinding
 
     enum class PathSearchResult
     {
-        deadEnd,      // Path is a dead end, i.e. < 2 edges.
-        wide,         // Path with wide flag set.
-        thin,         // Path is simple.
-        junction,     // Path is a junction, i.e. > 2 edges.
-        rideQueue,    // Queue path connected to a ride.
-        rideEntrance, // Map element is a ride entrance.
-        rideExit,     // Map element is a ride exit.
-        parkExit,     // Park entrance / exit (map element is a park entrance/exit).
-        shopEntrance, // Map element is a shop entrance.
-        other,        // Path is other than the above.
-        loop,         // Loop detected.
-        limitReached, // Search limit reached without reaching path end.
-        failed,       // No path element found.
+        deadEnd,               // Path is a dead end, i.e. < 2 edges.
+        wide,                  // Path with wide flag set.
+        thin,                  // Path is simple.
+        junction,              // Path is a junction, i.e. > 2 edges.
+        rideQueue,             // Queue path connected to a ride.
+        rideEntrance,          // Map element is a ride entrance.
+        rideExit,              // Map element is a ride exit.
+        parkExit,              // Park entrance / exit (map element is a park entrance/exit).
+        shopEntrance,          // Map element is a shop entrance.
+        transportRideEntrance, // Map element is a free, open transport ride entrance.
+        other,                 // Path is other than the above.
+        loop,                  // Loop detected.
+        limitReached,          // Search limit reached without reaching path end.
+        failed,                // No path element found.
     };
 
 #pragma region Pathfinding Logging
@@ -128,6 +137,8 @@ namespace OpenRCT2::PathFinding
                 return "ParkEntryExit";
             case PathSearchResult::shopEntrance:
                 return "ShopEntrance";
+            case PathSearchResult::transportRideEntrance:
+                return "TransportRideEntrance";
             case PathSearchResult::limitReached:
                 return "LimitReached";
             case PathSearchResult::other:
@@ -141,6 +152,126 @@ namespace OpenRCT2::PathFinding
 
         return "Unknown";
     }
+#pragma endregion
+
+#pragma region Transport Ride Integration
+
+    /**
+     * Returns the next station a guest would exit at when boarding a transport ride.
+     * For continuous circuit: next station in index order (wrapping).
+     * For 2-station shuttle: the other station.
+     */
+    static std::optional<StationIndex> GetNextStationForTransport(const Ride& ride, StationIndex entranceStation)
+    {
+        uint8_t curIdx = entranceStation.ToUnderlying();
+
+        if (ride.mode == RideMode::shuttle && ride.numStations == 2)
+        {
+            uint8_t nextIdx = (curIdx == 0) ? 1 : 0;
+            const auto& nextStation = ride.getStation(StationIndex::FromUnderlying(nextIdx));
+            if (!nextStation.start.isNull() && !nextStation.exit.isNull())
+                return StationIndex::FromUnderlying(nextIdx);
+            return std::nullopt;
+        }
+
+        auto stations = ride.getStations();
+        uint8_t validStationsChecked = 0;
+        for (uint8_t offset = 1; offset <= Limits::kMaxStationsPerRide && validStationsChecked < ride.numStations; offset++)
+        {
+            uint8_t nextIdx = (curIdx + offset) % Limits::kMaxStationsPerRide;
+            const auto& station = stations[nextIdx];
+
+            if (station.start.isNull())
+                continue;
+
+            validStationsChecked++;
+
+            if (!station.exit.isNull())
+                return StationIndex::FromUnderlying(nextIdx);
+        }
+
+        return std::nullopt;
+    }
+
+    static bool IsUsableTransportRide(const Ride& ride)
+    {
+        if (!ride.getRideTypeDescriptor().flags.has(RtdFlag::isTransportRide))
+            return false;
+        if (ride.status != RideStatus::open)
+            return false;
+        if (ride.flags.has(RideFlag::queueFull))
+            return false;
+        if (RideGetPrice(ride) != 0)
+            return false;
+        if (ride.numStations < 2)
+            return false;
+        if (ride.mode == RideMode::shuttle && ride.numStations > 2)
+            return false;
+        return true;
+    }
+
+    // Not cached: a cache outside the park state would differ between server and a client that joins later,
+    // causing guests to path differently and the client to desync in multiplayer.
+    static bool HasUsableTransportRide()
+    {
+        auto& gameState = getGameState();
+        for (const auto& ride : RideManager(gameState))
+        {
+            if (IsUsableTransportRide(ride))
+                return true;
+        }
+        return false;
+    }
+
+    // TODO: Zero cost means transport always wins. Needs a proper cost model.
+    static uint8_t CalculateTransportCost(
+        [[maybe_unused]] const RideStation& entranceStation, [[maybe_unused]] const RideStation& exitStation)
+    {
+        return 0;
+    }
+
+    static std::optional<Direction> FindExitFacingDirection(const TileCoordsXYZ& exitLoc)
+    {
+        TileElement* element = MapGetFirstElementAt(exitLoc);
+        if (element == nullptr)
+            return std::nullopt;
+
+        do
+        {
+            if (element->getType() != TileElementType::entrance)
+                continue;
+            if (element->baseHeight != exitLoc.z)
+                continue;
+            if (element->asEntrance()->getEntranceType() != EntranceType::rideExit)
+                continue;
+
+            return DirectionReverse(element->getDirection());
+        } while (!(element++)->isLastForTile());
+
+        return std::nullopt;
+    }
+
+    static TileElement* FindPathTileElementNearExit(const TileCoordsXYZ& loc, int& outZ)
+    {
+        TileElement* element = MapGetFirstElementAt(loc);
+        if (element == nullptr)
+            return nullptr;
+
+        do
+        {
+            if (element->getType() != TileElementType::path)
+                continue;
+
+            if (std::abs(element->baseHeight - loc.z) > kPathHeightTolerance)
+                continue;
+
+            outZ = element->baseHeight;
+            return element;
+        } while (!(element++)->isLastForTile());
+
+        return nullptr;
+    }
+
 #pragma endregion
 
     static const TileElement* GetBannerOnPath(const TileElement* pathElement)
@@ -328,10 +459,10 @@ namespace OpenRCT2::PathFinding
     /**
      *
      * Returns:
-     *   PathSearchResult::Wide - path with wide flag set
-     *   PathSearchResult::RideQueue - queue path connected to a ride
-     *   PathSearchResult::Other - other path than the above
-     *   PathSearchResult::Failed - no path element found
+     *   PathSearchResult::wide - path with wide flag set
+     *   PathSearchResult::rideQueue - queue path connected to a ride
+     *   PathSearchResult::other - other path than the above
+     *   PathSearchResult::failed - no path element found
      *
      *  rct2: 0x00694BAE
      *
@@ -377,15 +508,15 @@ namespace OpenRCT2::PathFinding
     /**
      *
      * Returns:
-     *   PathSearchResult::DeadEnd - path is a dead end, i.e. < 2 edges
-     *   PathSearchResult::Wide - path with wide flag set
-     *   PathSearchResult::Junction - path is a junction, i.e. > 2 edges
-     *   PathSearchResult::RideEntrance - map element is a ride entrance
-     *   PathSearchResult::RideExit - map element is a ride exit
-     *   PathSearchResult::ParkExit - park entrance / exit (map element is a park entrance/exit)
-     *   PathSearchResult::ShopEntrance - map element is a shop entrance
-     *   PathSearchResult::LimitReached - search limit reached without reaching path end
-     *   PathSearchResult::Failed - no path element found
+     *   PathSearchResult::deadEnd - path is a dead end, i.e. < 2 edges
+     *   PathSearchResult::wide - path with wide flag set
+     *   PathSearchResult::junction - path is a junction, i.e. > 2 edges
+     *   PathSearchResult::rideEntrance - map element is a ride entrance
+     *   PathSearchResult::rideExit - map element is a ride exit
+     *   PathSearchResult::parkExit - park entrance / exit (map element is a park entrance/exit)
+     *   PathSearchResult::shopEntrance - map element is a shop entrance
+     *   PathSearchResult::limitReached - search limit reached without reaching path end
+     *   PathSearchResult::failed - no path element found
      * For return values RideEntrance, RideExit & ShopEntrance the rideIndex is stored in outRideIndex.
      *
      *  rct2: 0x006949B9
@@ -488,15 +619,15 @@ namespace OpenRCT2::PathFinding
 
     /**
      * Returns:
-     *   PathSearchResult::DeadEnd - path is a dead end, i.e. < 2 edges
-     *   PathSearchResult::Wide - path with wide flag set
-     *   PathSearchResult::Junction - path is a junction, i.e. > 2 edges
-     *   PathSearchResult::RideEntrance - map element is a ride entrance
-     *   PathSearchResult::RideExit - map element is a ride exit
-     *   PathSearchResult::ParkExit - ark entrance / exit (map element is a park entrance/exit
-     *   PathSearchResult::ShopEntrance - map element is a shop entrance
-     *   PathSearchResult::LimitReached - search limit reached without reaching path end
-     *   PathSearchResult::Failed - no path element found
+     *   PathSearchResult::deadEnd - path is a dead end, i.e. < 2 edges
+     *   PathSearchResult::wide - path with wide flag set
+     *   PathSearchResult::junction - path is a junction, i.e. > 2 edges
+     *   PathSearchResult::rideEntrance - map element is a ride entrance
+     *   PathSearchResult::rideExit - map element is a ride exit
+     *   PathSearchResult::parkExit - ark entrance / exit (map element is a park entrance/exit
+     *   PathSearchResult::shopEntrance - map element is a shop entrance
+     *   PathSearchResult::limitReached - search limit reached without reaching path end
+     *   PathSearchResult::failed - no path element found
      * For return values RideEntrance, RideExit & ShopEntrance the rideIndex is stored in outRideIndex.
      *
      *  rct2: 0x006949A4
@@ -773,6 +904,8 @@ namespace OpenRCT2::PathFinding
                 continue;
 
             RideId rideIndex = RideId::GetNull();
+            // Store the transport ride when it finds a usable transport entrance
+            Ride* transportRide = nullptr;
             switch (tileElement->getType())
             {
                 case TileElementType::track:
@@ -804,12 +937,20 @@ namespace OpenRCT2::PathFinding
                              * (in the case when the station has no exit),
                              * the goal is the ride entrance tile. */
                             direction = tileElement->getDirection();
+                            rideIndex = tileElement->asEntrance()->getRideIndex();
+
                             if (direction == testEdge)
                             {
-                                /* The rideIndex will be useful for
-                                 * adding transport rides later. */
-                                rideIndex = tileElement->asEntrance()->getRideIndex();
                                 searchResult = PathSearchResult::rideEntrance;
+                                if (state.hasUsableTransport)
+                                {
+                                    auto* ride = GetRide(rideIndex);
+                                    if (ride != nullptr && IsUsableTransportRide(*ride))
+                                    {
+                                        searchResult = PathSearchResult::transportRideEntrance;
+                                        transportRide = ride;
+                                    }
+                                }
                                 found = true;
                                 break;
                             }
@@ -876,11 +1017,18 @@ namespace OpenRCT2::PathFinding
                         {
                             if (state.ignoreForeignQueues && !pathElement->getRideIndex().IsNull())
                             {
-                                // Path is a queue we aren't interested in
-                                /* The rideIndex will be useful for
-                                 * adding transport rides later. */
-                                rideIndex = pathElement->getRideIndex();
-                                searchResult = PathSearchResult::rideQueue;
+                                bool isTransportQueue = false;
+                                if (state.hasUsableTransport)
+                                {
+                                    rideIndex = pathElement->getRideIndex();
+                                    auto* queueRide = GetRide(rideIndex);
+                                    isTransportQueue = (queueRide != nullptr && IsUsableTransportRide(*queueRide));
+                                }
+
+                                if (!isTransportQueue)
+                                {
+                                    searchResult = PathSearchResult::rideQueue;
+                                }
                             }
                         }
                     }
@@ -935,6 +1083,68 @@ namespace OpenRCT2::PathFinding
             }
 
             /* At this point the map element tile is not the goal. */
+
+            if (searchResult == PathSearchResult::transportRideEntrance)
+            {
+                if (transportRide != nullptr && state.usedTransportRideId != rideIndex)
+                {
+                    StationIndex entranceStationIdx = tileElement->asEntrance()->getStationIndex();
+                    auto nextStationOpt = GetNextStationForTransport(*transportRide, entranceStationIdx);
+
+                    if (nextStationOpt.has_value())
+                    {
+                        const auto& entranceStation = transportRide->getStation(entranceStationIdx);
+                        const auto& exitStation = transportRide->getStation(nextStationOpt.value());
+
+                        if (!exitStation.exit.isNull())
+                        {
+                            TileCoordsXYZ exitLoc{ exitStation.exit.x, exitStation.exit.y, exitStation.exit.z };
+
+                            uint16_t exitHeuristic = CalculateHeuristicPathingScore(exitLoc, goal);
+                            if (exitHeuristic >= *endScore)
+                                continue;
+
+                            auto exitDirOpt = FindExitFacingDirection(exitLoc);
+                            if (exitDirOpt.has_value())
+                            {
+                                TileCoordsXYZ pathLoc = exitLoc;
+                                pathLoc += TileDirectionDelta[exitDirOpt.value()];
+
+                                int pathZ = pathLoc.z;
+                                TileElement* exitPathElement = FindPathTileElementNearExit(pathLoc, pathZ);
+
+                                if (exitPathElement != nullptr)
+                                {
+                                    RideId savedTransportId = state.usedTransportRideId;
+                                    state.usedTransportRideId = rideIndex;
+
+                                    pathLoc.z = pathZ;
+                                    uint8_t exitEdges = exitPathElement->asPath()->getEdges();
+                                    uint8_t transportCost = CalculateTransportCost(entranceStation, exitStation);
+
+                                    for (Direction exitDir = 0; exitDir < kNumOrthogonalDirections; exitDir++)
+                                    {
+                                        if (!(exitEdges & (1 << exitDir)))
+                                            continue;
+
+                                        PeepPathfindHeuristicSearch(
+                                            state, pathLoc, goal, peep, exitPathElement, inPatrolArea, transportCost, endScore,
+                                            exitDir, endJunctions, junctionList, directionList, endXYZ, endSteps);
+                                    }
+
+                                    if (*endScore < 65535)
+                                    {
+                                        state.foundPathViaTransport = true;
+                                    }
+
+                                    state.usedTransportRideId = savedTransportId;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
 
             /* If this map element is not a path, the search cannot be continued.
              * Continue to the next map element without updating the parameters (best result so far). */
@@ -1230,6 +1440,9 @@ namespace OpenRCT2::PathFinding
 
         state.ignoreForeignQueues = ignoreForeignQueues;
         state.queueRideIndex = queueRideIndex;
+        state.usedTransportRideId = RideId::GetNull();
+        state.foundPathViaTransport = false;
+        state.hasUsableTransport = (peep.as<Guest>() != nullptr) && HasUsableTransportRide();
 
         // The max number of thin junctions searched - a per-search-path limit.
         state.maxJunctions = PeepPathfindGetMaxNumberJunctions(peep);
@@ -1452,9 +1665,14 @@ namespace OpenRCT2::PathFinding
                 LogPathfinding(
                     &peep, "Pathfind searching in direction: %d from %d,%d,%d", testEdge, loc.x >> 5, loc.y >> 5, loc.z);
 
+                state.foundPathViaTransport = false;
+                state.usedTransportRideId = RideId::GetNull();
+
                 PeepPathfindHeuristicSearch(
                     state, { loc.x, loc.y, height }, goal, peep, firstTileElement, inPatrolArea, 0, &score, testEdge,
                     &endJunctions, endJunctionList, endDirectionList, &endXYZ, &endSteps);
+
+                bool usedTransport = state.foundPathViaTransport;
 
                 if constexpr (kLogPathfinding)
                 {
@@ -1469,7 +1687,9 @@ namespace OpenRCT2::PathFinding
                     }
                 }
 
-                if (score < bestScore || (score == bestScore && endSteps < bestSub))
+                bool isBetter = (score < bestScore) || (score == bestScore && endSteps < bestSub)
+                    || (score == bestScore && endSteps == bestSub && usedTransport);
+                if (isBetter)
                 {
                     chosenEdge = testEdge;
                     bestScore = score;
